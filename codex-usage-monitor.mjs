@@ -159,6 +159,44 @@ function latestRateLimitSnapshot(threadId) {
   return latest;
 }
 
+function latestTokenCount(threadId) {
+  const files = sessionFilesForThread(threadId);
+  let latest = null;
+
+  for (const file of files) {
+    let raw = "";
+    try {
+      raw = fs.readFileSync(file, "utf8").trimEnd();
+    } catch {
+      continue;
+    }
+    if (!raw) continue;
+
+    const lines = raw.split("\n");
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      try {
+        const record = JSON.parse(lines[i]);
+        if (record?.payload?.type !== "token_count") continue;
+        const info = record.payload.info || {};
+        const total = info.total_token_usage || {};
+        const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
+        if (!latest || ts > latest.timestamp) {
+          latest = {
+            timestamp: ts,
+            totalTokens: Number(total.total_tokens || 0),
+            cachedTokens: Number(total.cached_input_tokens || 0),
+          };
+        }
+        break;
+      } catch {
+        // ignore malformed lines
+      }
+    }
+  }
+
+  return latest;
+}
+
 function query(sql) {
   return execFileSync("sqlite3", ["-readonly", "-separator", "\t", DB_PATH, sql], {
     encoding: "utf8",
@@ -174,13 +212,14 @@ function readUsage() {
   );
   const threadId = latestThreadId();
   const recentRaw = query(
-    "select updated_at, tokens_used, source, model_provider, replace(substr(title, 1, 70), char(9), ' ') from threads where archived = 0 order by updated_at desc limit 5;"
+    "select id, updated_at, tokens_used, source, model_provider, replace(substr(title, 1, 70), char(9), ' ') from threads where archived = 0 order by updated_at desc limit 5;"
   );
 
   const recent = recentRaw
     ? recentRaw.split("\n").map((line) => {
-        const [updatedAt, tokensUsed, source, provider, title] = line.split("\t");
+        const [id, updatedAt, tokensUsed, source, provider, title] = line.split("\t");
         return {
+          id: id || "",
           updatedAt: Number(updatedAt || 0),
           tokensUsed: Number(tokensUsed || 0),
           source: source || "",
@@ -289,10 +328,12 @@ function renderRecent(recent) {
 
   for (const row of recent.slice(0, 5)) {
     const time = color(formatTime(row.updatedAt).padEnd(10), ansi.dim);
-    const tokens = color(fmt(row.tokensUsed).padStart(11), ansi.magenta);
+    const token = latestTokenCount(row.id);
+    const tokens = color(fmt(token?.totalTokens ?? row.tokensUsed).padStart(11), ansi.magenta);
     const scope = color((row.provider || row.source || "").padEnd(6), ansi.cyan);
     const title = row.title || "(untitled)";
-    console.log(`${time} ${tokens} ${scope} ${title}`);
+    const tokenNote = token?.cachedTokens ? color(`(+ ${fmt(token.cachedTokens)} cached)`, ansi.dim) : "";
+    console.log(`${time} ${tokens} ${scope} ${title}${tokenNote ? ` ${tokenNote}` : ""}`);
   }
 }
 
