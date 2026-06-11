@@ -9,6 +9,8 @@ const DB_PATH = path.join(os.homedir(), ".codex", "state_5.sqlite");
 const SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 const ARCHIVE_DIR = path.join(os.homedir(), ".codex", "archived_sessions");
 const REFRESH_MS = Number(process.env.CODEX_USAGE_REFRESH_MS || 5000);
+let recentSnapshotKey = "";
+let recentSnapshotRows = [];
 
 const ansi = {
   reset: "\x1b[0m",
@@ -115,10 +117,22 @@ function extractRateLimits(record) {
   return record?.payload?.rate_limits || record?.payload?.info?.rate_limits || null;
 }
 
+function sessionThreadId(file) {
+  try {
+    const firstLine = fs.readFileSync(file, "utf8").split("\n", 1)[0];
+    if (!firstLine) return "";
+    const record = JSON.parse(firstLine);
+    if (record?.type !== "session_meta") return "";
+    return record?.payload?.parent_thread_id || record?.payload?.id || "";
+  } catch {
+    return "";
+  }
+}
+
 function sessionFilesForThread(threadId) {
   const files = [...walkJsonlFiles(SESSIONS_DIR), ...walkJsonlFiles(ARCHIVE_DIR)];
   if (!threadId) return files;
-  return files.filter((file) => file.includes(threadId));
+  return files.filter((file) => sessionThreadId(file) === threadId);
 }
 
 function latestRateLimitSnapshot(threadId) {
@@ -195,6 +209,16 @@ function latestTokenCount(threadId) {
   }
 
   return latest;
+}
+
+function stableRecentRows(recent) {
+  const rows = recent.slice(0, 5);
+  const key = rows.map((row) => row.id).join("|");
+  if (key !== recentSnapshotKey) {
+    recentSnapshotKey = key;
+    recentSnapshotRows = rows.map((row) => ({ ...row }));
+  }
+  return recentSnapshotRows;
 }
 
 function query(sql) {
@@ -321,12 +345,13 @@ function renderCards(left, right) {
 
 function renderRecent(recent) {
   console.log(color("Recent threads", ansi.bold + ansi.white));
-  if (recent.length === 0) {
+  const rows = stableRecentRows(recent);
+  if (rows.length === 0) {
     console.log(color("  no local threads yet", ansi.dim));
     return;
   }
 
-  for (const row of recent.slice(0, 5)) {
+  for (const row of rows) {
     const time = color(formatTime(row.updatedAt).padEnd(10), ansi.dim);
     const token = latestTokenCount(row.id);
     const tokens = color(fmt(token?.totalTokens ?? row.tokensUsed).padStart(11), ansi.magenta);
