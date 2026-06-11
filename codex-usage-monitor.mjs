@@ -11,6 +11,7 @@ const ARCHIVE_DIR = path.join(os.homedir(), ".codex", "archived_sessions");
 const REFRESH_MS = Number(process.env.CODEX_USAGE_REFRESH_MS || 5000);
 let recentSnapshotKey = "";
 let recentSnapshotRows = [];
+const recentTokenCache = new Map();
 
 const ansi = {
   reset: "\x1b[0m",
@@ -213,7 +214,7 @@ function latestTokenCount(threadId) {
 
 function stableRecentRows(recent) {
   const rows = recent.slice(0, 5);
-  const key = rows.map((row) => row.id).join("|");
+  const key = rows.map((row) => `${row.id}:${row.updatedAt}:${row.tokensUsed}:${row.title}`).join("|");
   if (key !== recentSnapshotKey) {
     recentSnapshotKey = key;
     recentSnapshotRows = rows.map((row) => ({ ...row }));
@@ -353,11 +354,15 @@ function renderRecent(recent) {
 
   for (const row of rows) {
     const time = color(formatTime(row.updatedAt).padEnd(10), ansi.dim);
-    const token = latestTokenCount(row.id);
-    const tokens = color(fmt(token?.totalTokens ?? row.tokensUsed).padStart(11), ansi.magenta);
+    let token = recentTokenCache.get(row.id);
+    if (!token || token.updatedAt !== row.updatedAt) {
+      token = { updatedAt: row.updatedAt, value: latestTokenCount(row.id) };
+      recentTokenCache.set(row.id, token);
+    }
+    const tokens = color(fmt(token.value?.totalTokens ?? row.tokensUsed).padStart(11), ansi.magenta);
     const scope = color((row.provider || row.source || "").padEnd(6), ansi.cyan);
     const title = row.title || "(untitled)";
-    const tokenNote = token?.cachedTokens ? color(`(+ ${fmt(token.cachedTokens)} cached)`, ansi.dim) : "";
+    const tokenNote = token.value?.cachedTokens ? color(`(+ ${fmt(token.value.cachedTokens)} cached)`, ansi.dim) : "";
     console.log(`${time} ${tokens} ${scope} ${title}${tokenNote ? ` ${tokenNote}` : ""}`);
   }
 }
