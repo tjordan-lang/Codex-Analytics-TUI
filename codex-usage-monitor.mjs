@@ -396,8 +396,28 @@ function render(state) {
   console.log(color(`Refresh every ${Math.round(REFRESH_MS / 1000)}s  Ctrl-C to quit`, ansi.dim));
 }
 
+function renderKey(state) {
+  return JSON.stringify({
+    error: state.error,
+    totalToday: state.totalToday,
+    totalAll: state.totalAll,
+    threadId: state.threadId,
+    rateTimestamp: state.rate?.timestamp,
+    rateLimits: state.rate?.rateLimits,
+    recent: state.recent.map((row) => ({
+      id: row.id,
+      updatedAt: row.updatedAt,
+      tokensUsed: row.tokensUsed,
+      provider: row.provider,
+      source: row.source,
+      title: row.title,
+    })),
+  });
+}
+
 async function main() {
   let state = { updatedAt: null, totalToday: 0, totalAll: 0, recent: [], rate: null, error: null };
+  let lastRenderKey = "";
 
   const tick = () => {
     try {
@@ -409,7 +429,11 @@ async function main() {
         error: err instanceof Error ? err.message : String(err),
       };
     }
-    render(state);
+    const key = renderKey(state);
+    if (key !== lastRenderKey) {
+      lastRenderKey = key;
+      render(state);
+    }
   };
 
   tick();
