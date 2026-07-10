@@ -217,12 +217,22 @@ function scanTailForFirstMatch(files, predicate) {
 
 function latestRateLimitSnapshot(threadId) {
   const files = sessionFilesForThread(threadId);
-  return scanTailForFirstMatch(files, (record, file) => {
+  const latest = scanTailForFirstMatch(files, (record, file) => {
     const rateLimits = extractRateLimits(record);
     if (!rateLimits?.primary || !rateLimits?.secondary) return null;
     const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
     return { file, timestamp: ts, rateLimits };
   });
+  if (!latest) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const rateLimits = Object.fromEntries(
+    Object.entries(latest.rateLimits).map(([name, limit]) => [
+      name,
+      limit?.resets_at && limit.resets_at <= now ? { ...limit, used_percent: 0 } : limit,
+    ])
+  );
+  return { ...latest, rateLimits };
 }
 
 function latestTokenCount(threadId) {
