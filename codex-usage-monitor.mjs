@@ -170,7 +170,7 @@ function extractRateLimits(record) {
 
 function sessionThreadId(file) {
   try {
-    const firstLine = fs.readFileSync(file, "utf8").split("\n", 1)[0];
+    const firstLine = readFileHead(file).split("\n", 1)[0];
     if (!firstLine) return "";
     const record = JSON.parse(firstLine);
     if (record?.type !== "session_meta") return "";
@@ -186,12 +186,36 @@ function sessionFilesForThread(threadId) {
   return files.filter((file) => sessionThreadId(file) === threadId);
 }
 
-function scanTailForFirstMatch(files, predicate) {
+function readFileTail(file, maxBytes = 128 * 1024) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const { size } = fs.fstatSync(fd);
+    const length = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, size - length);
+    return buffer.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readFileHead(file, maxBytes = 8192) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function scanTailForFirstMatch(files, predicate, tailBytes = 0) {
   let latest = null;
   for (const file of files) {
     let raw = "";
     try {
-      raw = fs.readFileSync(file, "utf8").trimEnd();
+      raw = (tailBytes ? readFileTail(file, tailBytes) : fs.readFileSync(file, "utf8")).trimEnd();
     } catch {
       continue;
     }
@@ -215,21 +239,40 @@ function scanTailForFirstMatch(files, predicate) {
   return latest;
 }
 
-let rateSnapshotCache = null;
+const rateSnapshotFileCache = new Map();
 
-function latestRateLimitSnapshot(threadId) {
-  const files = sessionFilesForThread(threadId);
-  const candidate = scanTailForFirstMatch(files, (record, file) => {
-    const rateLimits = extractRateLimits(record);
-    if (!rateLimits?.primary || !rateLimits?.secondary) return null;
-    if (rateLimits.limit_id && rateLimits.limit_id !== "codex") return null;
-    const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
-    return { file, timestamp: ts, rateLimits };
-  });
-  if (candidate && (!rateSnapshotCache || candidate.timestamp > rateSnapshotCache.timestamp)) {
-    rateSnapshotCache = candidate;
+function latestRateLimitSnapshot() {
+  let latest = null;
+  const files = [...walkJsonlFiles(SESSIONS_DIR), ...walkJsonlFiles(ARCHIVE_DIR)]
+    .map((file) => {
+      try {
+        return { file, stat: fs.statSync(file) };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+
+  for (const { file, stat } of files) {
+    if (latest && stat.mtimeMs / 1000 <= latest.timestamp) break;
+
+    const cached = rateSnapshotFileCache.get(file);
+    let candidate = cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs ? cached.value : undefined;
+    if (candidate === undefined) {
+      const scanned = scanTailForFirstMatch([file], (record, filePath) => {
+        const rateLimits = extractRateLimits(record);
+        if (!rateLimits?.primary || !rateLimits?.secondary) return null;
+        if (rateLimits.limit_id && rateLimits.limit_id !== "codex") return null;
+        const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
+        return { file: filePath, timestamp: ts, rateLimits };
+      }, 128 * 1024);
+      candidate = scanned ?? cached?.value ?? null;
+      rateSnapshotFileCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, value: candidate });
+    }
+    if (candidate && (!latest || candidate.timestamp > latest.timestamp)) latest = candidate;
   }
-  const latest = rateSnapshotCache;
+
   if (!latest) return null;
 
   const now = Math.floor(Date.now() / 1000);
@@ -325,7 +368,7 @@ function readUsage() {
     threadCount,
     recent,
     threadId,
-    rate: latestRateLimitSnapshot(threadId),
+    rate: latestRateLimitSnapshot(),
     error: null,
   };
 }
