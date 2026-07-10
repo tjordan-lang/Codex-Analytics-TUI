@@ -170,7 +170,7 @@ function extractRateLimits(record) {
 
 function sessionThreadId(file) {
   try {
-    const firstLine = fs.readFileSync(file, "utf8").split("\n", 1)[0];
+    const firstLine = readFileHead(file).split("\n", 1)[0];
     if (!firstLine) return "";
     const record = JSON.parse(firstLine);
     if (record?.type !== "session_meta") return "";
@@ -186,12 +186,36 @@ function sessionFilesForThread(threadId) {
   return files.filter((file) => sessionThreadId(file) === threadId);
 }
 
-function scanTailForFirstMatch(files, predicate) {
+function readFileTail(file, maxBytes = 128 * 1024) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const { size } = fs.fstatSync(fd);
+    const length = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, size - length);
+    return buffer.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readFileHead(file, maxBytes = 8192) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function scanTailForFirstMatch(files, predicate, tailBytes = 0) {
   let latest = null;
   for (const file of files) {
     let raw = "";
     try {
-      raw = fs.readFileSync(file, "utf8").trimEnd();
+      raw = (tailBytes ? readFileTail(file, tailBytes) : fs.readFileSync(file, "utf8")).trimEnd();
     } catch {
       continue;
     }
@@ -215,14 +239,40 @@ function scanTailForFirstMatch(files, predicate) {
   return latest;
 }
 
-function latestRateLimitSnapshot(threadId) {
-  const files = sessionFilesForThread(threadId);
-  const latest = scanTailForFirstMatch(files, (record, file) => {
-    const rateLimits = extractRateLimits(record);
-    if (!rateLimits?.primary || !rateLimits?.secondary) return null;
-    const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
-    return { file, timestamp: ts, rateLimits };
-  });
+const rateSnapshotFileCache = new Map();
+
+function latestRateLimitSnapshot() {
+  let latest = null;
+  const files = [...walkJsonlFiles(SESSIONS_DIR), ...walkJsonlFiles(ARCHIVE_DIR)]
+    .map((file) => {
+      try {
+        return { file, stat: fs.statSync(file) };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+
+  for (const { file, stat } of files) {
+    if (latest && stat.mtimeMs / 1000 <= latest.timestamp) break;
+
+    const cached = rateSnapshotFileCache.get(file);
+    let candidate = cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs ? cached.value : undefined;
+    if (candidate === undefined) {
+      const scanned = scanTailForFirstMatch([file], (record, filePath) => {
+        const rateLimits = extractRateLimits(record);
+        if (!rateLimits?.primary || !rateLimits?.secondary) return null;
+        if (rateLimits.limit_id && rateLimits.limit_id !== "codex") return null;
+        const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
+        return { file: filePath, timestamp: ts, rateLimits };
+      }, 128 * 1024);
+      candidate = scanned ?? cached?.value ?? null;
+      rateSnapshotFileCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, value: candidate });
+    }
+    if (candidate && (!latest || candidate.timestamp > latest.timestamp)) latest = candidate;
+  }
+
   if (!latest) return null;
 
   const now = Math.floor(Date.now() / 1000);
@@ -235,7 +285,7 @@ function latestRateLimitSnapshot(threadId) {
   return { ...latest, rateLimits };
 }
 
-function latestTokenCount(threadId) {
+function latestCachedTokenCount(threadId) {
   const files = sessionFilesForThread(threadId);
   return scanTailForFirstMatch(files, (record) => {
     if (record?.payload?.type !== "token_count") return null;
@@ -244,7 +294,6 @@ function latestTokenCount(threadId) {
     const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
     return {
       timestamp: ts,
-      totalTokens: Number(total.total_tokens || 0),
       cachedTokens: Number(total.cached_input_tokens || 0),
     };
   });
@@ -259,7 +308,7 @@ const recentTokenCache = new Map();
 function cachedTokenCount(id, updatedAt) {
   let cached = recentTokenCache.get(id);
   if (cached && cached.updatedAt === updatedAt) return cached.value;
-  const tk = latestTokenCount(id);
+  const tk = latestCachedTokenCount(id);
   cached = { updatedAt, value: tk };
   recentTokenCache.set(id, cached);
   return tk;
@@ -279,7 +328,7 @@ function query(sql) {
 
 function readUsage() {
   const since = localMidnightEpoch();
-  const totalAll = Number(query("select coalesce(sum(tokens_used), 0) from threads where archived = 0;") || 0);
+  const totalAll = Number(query("select coalesce(sum(tokens_used), 0) from threads;") || 0);
   const totalToday = Number(
     query(`select coalesce(sum(tokens_used), 0) from threads where archived = 0 and created_at >= ${since};`) || 0
   );
@@ -309,15 +358,7 @@ function readUsage() {
   recent.forEach((row) => {
     if (!row.id) return;
     const tk = cachedTokenCount(row.id, row.updatedAt);
-    if (tk) {
-      row.totalTokens = tk.totalTokens;
-      row.cachedTokens = tk.cachedTokens;
-      row.tokenTs = tk.timestamp;
-    } else {
-      row.totalTokens = row.tokensUsed;
-      row.cachedTokens = 0;
-      row.tokenTs = row.updatedAt;
-    }
+    row.cachedTokens = tk?.cachedTokens ?? 0;
   });
 
   return {
@@ -327,7 +368,7 @@ function readUsage() {
     threadCount,
     recent,
     threadId,
-    rate: latestRateLimitSnapshot(threadId),
+    rate: latestRateLimitSnapshot(),
     error: null,
   };
 }
@@ -358,7 +399,8 @@ function gauge(remaining, width = 30) {
 // footer line showing resets-at + a countdown.
 function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
   const width = opts.width || 40;
-  const remaining = remainingPercent(usedPercent);
+  const available = usedPercent != null;
+  const remaining = available ? remainingPercent(usedPercent) : null;
   const pctColor = gaugeColor(usedPercent);
   const gaugeWidth = width - 4;
 
@@ -366,11 +408,17 @@ function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
   const bottom = color(`└${"─".repeat(width - 2)}┘`, ansi.rule);
 
   const titleLine = ` ${color(title, ansi.bold + ansi.white)}${subtitle ? color("  " + subtitle, ansi.muted) : ""}`;
-  const big = ` ${color(`${remaining.toFixed(0)}`, ansi.bold + pctColor)}${color("%", ansi.muted)} ${color("remaining", ansi.muted)}`;
-  const usedLine = ` ${color("used ", ansi.muted)}${color(`${Number(usedPercent || 0).toFixed(1)}%`, ansi.white)}`;
-  const gaugeLine = ` ${color(gauge(remaining, gaugeWidth), pctColor)}`;
+  const big = available
+    ? ` ${color(`${remaining.toFixed(0)}`, ansi.bold + pctColor)}${color("%", ansi.muted)} ${color("remaining", ansi.muted)}`
+    : ` ${color("— unavailable", ansi.yellow)}`;
+  const usedLine = available
+    ? ` ${color("used ", ansi.muted)}${color(`${Number(usedPercent).toFixed(1)}%`, ansi.white)}`
+    : "";
+  const gaugeLine = available ? ` ${color(gauge(remaining, gaugeWidth), pctColor)}` : "";
   const resetIn = countdown(resetsAt);
-  const resetLine = ` ${color("resets", ansi.muted)} ${color(formatDateTime(resetsAt), ansi.white)} ${color(`(in ${resetIn})`, ansi.muted)}`;
+  const resetLine = available
+    ? ` ${color("resets", ansi.muted)} ${color(formatDateTime(resetsAt), ansi.white)} ${color(`(in ${resetIn})`, ansi.muted)}`
+    : ` ${color("waiting for a local snapshot", ansi.muted)}`;
 
   const lines = [top];
   for (const body of [titleLine, big, usedLine, gaugeLine, resetLine]) {
@@ -385,41 +433,46 @@ function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
 // ---------------------------------------------------------------------------
 
 function makeLayout(state) {
-  const cols = Math.max(72, Math.min(120, process.stdout.columns || 80));
+  const cols = Math.max(40, Math.min(120, process.stdout.columns || 80));
   const gap = 2;
-  const cardWidth = Math.floor((cols - gap) / 2);
+  const sideBySide = cols >= 72;
+  const cardWidth = sideBySide ? Math.floor((cols - gap) / 2) : cols;
 
   // Cards: 5h and Weekly. Identical width, side by side.
   const fiveH = buildCard(
     "5-hour usage limit",
-    state.rate ? null : color("no snapshot", ansi.yellow),
-    state.rate?.rateLimits?.primary?.used_percent ?? 0,
+    null,
+    state.rate?.rateLimits?.primary?.used_percent ?? null,
     state.rate?.rateLimits?.primary?.resets_at ?? 0,
     { width: cardWidth }
   );
   const weekly = buildCard(
     "Weekly usage limit",
     null,
-    state.rate?.rateLimits?.secondary?.used_percent ?? 0,
+    state.rate?.rateLimits?.secondary?.used_percent ?? null,
     state.rate?.rateLimits?.secondary?.resets_at ?? 0,
     { width: cardWidth }
   );
 
   const cardLines = [];
-  const height = Math.max(fiveH.length, weekly.length);
-  for (let i = 0; i < height; i += 1) {
-    const l = padRight(fiveH[i] || "", cardWidth);
-    const r = padRight(weekly[i] || "", cardWidth);
-    cardLines.push(`${l}${" ".repeat(gap)}${r}`);
+  if (sideBySide) {
+    const height = Math.max(fiveH.length, weekly.length);
+    for (let i = 0; i < height; i += 1) {
+      const l = padRight(fiveH[i] || "", cardWidth);
+      const r = padRight(weekly[i] || "", cardWidth);
+      cardLines.push(`${l}${" ".repeat(gap)}${r}`);
+    }
+  } else {
+    cardLines.push(...fiveH, "", ...weekly);
   }
 
   // Local usage panel.
   const localLines = [];
   localLines.push(color("Local usage", ansi.bold + ansi.white));
   localLines.push("");
-  localLines.push(`  ${color("today", ansi.muted)}    ${color(fmt(state.totalToday).padStart(14), ansi.green)} ${color("tokens", ansi.muted)}`);
-  localLines.push(`  ${color("all-time", ansi.muted)} ${color(fmt(state.totalAll).padStart(14), ansi.cyan)}  ${color("tokens", ansi.muted)}`);
-  localLines.push(`  ${color("threads", ansi.muted)}  ${color(String(state.threadCount).padStart(14), ansi.white)}  ${color("active", ansi.muted)}`);
+  localLines.push(`  ${color("started today", ansi.muted)} ${color(fmt(state.totalToday).padStart(14), ansi.green)} ${color("tokens", ansi.muted)}`);
+  localLines.push(`  ${color("all-time", ansi.muted)}      ${color(fmt(state.totalAll).padStart(14), ansi.cyan)} ${color("tokens", ansi.muted)}`);
+  localLines.push(`  ${color("active threads", ansi.muted)} ${color(String(state.threadCount).padStart(13), ansi.white)}`);
 
   // Recent threads table.
   const recentRows = state.recent.filter((row) => row.updatedAt > 0);
@@ -436,13 +489,12 @@ function makeLayout(state) {
     const hProvider = color("provider", ansi.muted);
     const hModel = color("model", ansi.muted);
     const hTitle = color("title", ansi.muted);
-    recentLines.push(`  ${hTime.padEnd(10)} ${hTokens.padEnd(10)} ${hProvider.padEnd(8)} ${hModel.padEnd(14)} ${hTitle}`);
+    recentLines.push(`  ${padRight(hTime, 10)} ${padRight(hTokens, 10)} ${padRight(hProvider, 8)} ${padRight(hModel, 14)} ${hTitle}`);
     recentLines.push(color("  " + "─".repeat(cols - 4), ansi.rule));
 
     for (const row of recentRows.slice(0, 5)) {
       const time = color(relativeTime(row.updatedAt).padEnd(10), ansi.grey);
-      const total = row.totalTokens ?? row.tokensUsed;
-      const tokens = color(fmtCompact(total).padStart(10), ansi.magenta);
+      const tokens = color(fmtCompact(row.tokensUsed).padStart(10), ansi.magenta);
       const provider = color(truncate((row.provider || row.source || "—").padEnd(8), 8), ansi.cyan);
       const model = color(truncate((row.model || "—").padEnd(14), 14), ansi.accentSoft);
       const title = row.title || "(untitled)";
@@ -478,6 +530,12 @@ function composeFrame(state) {
   const rule = color("─".repeat(cols), ansi.rule);
   lines.push(rule);
   lines.push("");
+
+  if (state.error) {
+    const error = String(state.error).replace(/\s+/g, " ");
+    lines.push(truncate(color(`Data error: ${error}`, ansi.red), cols));
+    lines.push("");
+  }
 
   // Cards.
   for (const line of cardLines) lines.push(truncate(line, cols));
@@ -558,7 +616,7 @@ function renderKey(state) {
     recent: state.recent.map((row) => ({
       id: row.id,
       updatedAt: row.updatedAt,
-      totalTokens: row.totalTokens,
+      tokensUsed: row.tokensUsed,
       cachedTokens: row.cachedTokens,
       provider: row.provider,
       model: row.model,
@@ -594,7 +652,7 @@ async function main() {
   const nextFrame = new Frame();
 
   const draw = () => {
-    const cols = Math.max(72, Math.min(120, process.stdout.columns || 80));
+    const cols = Math.max(40, Math.min(120, process.stdout.columns || 80));
     const lines = composeFrame(state);
     nextFrame.set(lines, cols);
 
