@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -262,7 +263,7 @@ function latestRateLimitSnapshot() {
     if (candidate === undefined) {
       const scanned = scanTailForFirstMatch([file], (record, filePath) => {
         const rateLimits = extractRateLimits(record);
-        if (!rateLimits?.primary || !rateLimits?.secondary) return null;
+        if (!rateLimits?.primary) return null;
         if (rateLimits.limit_id && rateLimits.limit_id !== "codex") return null;
         const ts = record.timestamp ? Math.floor(new Date(record.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
         return { file: filePath, timestamp: ts, rateLimits };
@@ -391,8 +392,23 @@ function gaugeColor(usedPercent) {
 
 function gauge(remaining, width = 30) {
   const p = Math.max(0, Math.min(100, Number(remaining || 0)));
-  const filled = Math.round((p / 100) * width);
-  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+  const safeWidth = Math.max(0, width);
+  const filled = Math.round((p / 100) * safeWidth);
+  return `${"█".repeat(filled)}${"░".repeat(safeWidth - filled)}`;
+}
+
+function limitTitle(limit) {
+  const minutes = Number(limit?.window_minutes || 0);
+  if (minutes === 300) return "5-hour usage limit";
+  if (minutes === 10080) return "Weekly usage limit";
+  if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60}-hour usage limit`;
+  return minutes ? `${minutes}-minute usage limit` : "Usage limit";
+}
+
+function activeLimits(rateLimits) {
+  return ["primary", "secondary"]
+    .map((name) => rateLimits?.[name])
+    .filter((limit) => limit && typeof limit.used_percent === "number");
 }
 
 // Build a usage card with a header strip, big remaining %, a gauge, and a
@@ -433,37 +449,29 @@ function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
 // ---------------------------------------------------------------------------
 
 function makeLayout(state) {
-  const cols = Math.max(40, Math.min(120, process.stdout.columns || 80));
+  const cols = Math.max(20, Math.min(120, process.stdout.columns || 80));
   const gap = 2;
-  const sideBySide = cols >= 72;
+  const limits = activeLimits(state.rate?.rateLimits);
+  const sideBySide = limits.length > 1 && cols >= 72;
   const cardWidth = sideBySide ? Math.floor((cols - gap) / 2) : cols;
-
-  // Cards: 5h and Weekly. Identical width, side by side.
-  const fiveH = buildCard(
-    "5-hour usage limit",
-    null,
-    state.rate?.rateLimits?.primary?.used_percent ?? null,
-    state.rate?.rateLimits?.primary?.resets_at ?? 0,
-    { width: cardWidth }
-  );
-  const weekly = buildCard(
-    "Weekly usage limit",
-    null,
-    state.rate?.rateLimits?.secondary?.used_percent ?? null,
-    state.rate?.rateLimits?.secondary?.resets_at ?? 0,
-    { width: cardWidth }
-  );
+  const cards = limits.length
+    ? limits.map((limit) => buildCard(limitTitle(limit), null, limit.used_percent, limit.resets_at, { width: cardWidth }))
+    : [buildCard("Usage limits", null, null, 0, { width: cardWidth })];
 
   const cardLines = [];
   if (sideBySide) {
-    const height = Math.max(fiveH.length, weekly.length);
+    const [leftCard, rightCard] = cards;
+    const height = Math.max(leftCard.length, rightCard.length);
     for (let i = 0; i < height; i += 1) {
-      const l = padRight(fiveH[i] || "", cardWidth);
-      const r = padRight(weekly[i] || "", cardWidth);
+      const l = padRight(leftCard[i] || "", cardWidth);
+      const r = padRight(rightCard[i] || "", cardWidth);
       cardLines.push(`${l}${" ".repeat(gap)}${r}`);
     }
   } else {
-    cardLines.push(...fiveH, "", ...weekly);
+    cards.forEach((card, index) => {
+      if (index) cardLines.push("");
+      cardLines.push(...card);
+    });
   }
 
   // Local usage panel.
@@ -499,7 +507,7 @@ function makeLayout(state) {
       const model = color(truncate((row.model || "—").padEnd(14), 14), ansi.accentSoft);
       const title = row.title || "(untitled)";
       const maxTitle = cols - 4 - 10 - 11 - 8 - 14 - 1;
-      const trimmedTitle = truncate(title, Math.max(20, maxTitle));
+      const trimmedTitle = truncate(title, Math.max(1, maxTitle));
       const cached = row.cachedTokens
         ? " " + color(`(+${fmtCompact(row.cachedTokens)} cached)`, ansi.muted)
         : "";
@@ -526,7 +534,7 @@ function composeFrame(state) {
   const statusWidth = visibleLen(status);
   const nameWidth = visibleLen(namePart);
   const spacer = " ".repeat(Math.max(2, cols - nameWidth - statusWidth));
-  lines.push(`${namePart}${spacer}${status}`);
+  lines.push(truncate(`${namePart}${spacer}${status}`, cols));
   const rule = color("─".repeat(cols), ansi.rule);
   lines.push(rule);
   lines.push("");
@@ -559,7 +567,7 @@ function composeFrame(state) {
   const rightWidth = visibleLen(right);
   const footerSpacer = " ".repeat(Math.max(1, cols - leftWidth - rightWidth));
   lines.push(rule);
-  lines.push(`${left}${footerSpacer}${right}`);
+  lines.push(truncate(`${left}${footerSpacer}${right}`, cols));
 
   return lines;
 }
@@ -652,11 +660,13 @@ async function main() {
   const nextFrame = new Frame();
 
   const draw = () => {
-    const cols = Math.max(40, Math.min(120, process.stdout.columns || 80));
+    const cols = Math.max(20, Math.min(120, process.stdout.columns || 80));
     const lines = composeFrame(state);
     nextFrame.set(lines, cols);
 
-    let out = diffAndDraw(prevFrame, nextFrame);
+    const resized = prevFrame.cols && prevFrame.cols !== cols;
+    if (resized) prevFrame.set([], 0);
+    let out = (resized ? ansi.clear + ansi.home : "") + diffAndDraw(prevFrame, nextFrame);
     if (out) process.stdout.write(out);
     prevFrame.set(lines, cols);
   };
@@ -714,8 +724,21 @@ async function main() {
   setInterval(clockTick, 1000);
 }
 
-main().catch((err) => {
-  process.stdout.write(ansi.show);
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+function selfCheck() {
+  assert.equal(limitTitle({ window_minutes: 300 }), "5-hour usage limit");
+  assert.equal(limitTitle({ window_minutes: 10080 }), "Weekly usage limit");
+  assert.equal(activeLimits({ primary: { used_percent: 10 }, secondary: null }).length, 1);
+  assert.equal(activeLimits({ primary: { used_percent: 10 }, secondary: { used_percent: 20 } }).length, 2);
+  const weekly = stripAnsi(buildCard(limitTitle({ window_minutes: 10080 }), null, 10, 0).join("\n"));
+  assert.match(weekly, /Weekly usage limit/);
+}
+
+if (process.env.CODEX_USAGE_MONITOR_SELF_TEST) {
+  selfCheck();
+} else {
+  main().catch((err) => {
+    process.stdout.write(ansi.show);
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}
