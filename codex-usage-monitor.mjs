@@ -86,6 +86,13 @@ function truncate(text, width) {
   return out + color(ellipsis, ansi.muted);
 }
 
+function terminalSize() {
+  return {
+    cols: Math.max(1, Math.min(120, process.stdout.columns || 80)),
+    rows: Math.max(1, process.stdout.rows || 24),
+  };
+}
+
 function goto(row, col = 1) {
   return `\x1b[${row};${col}H`;
 }
@@ -414,7 +421,7 @@ function activeLimits(rateLimits) {
 // Build a usage card with a header strip, big remaining %, a gauge, and a
 // footer line showing resets-at + a countdown.
 function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
-  const width = opts.width || 40;
+  const width = Math.max(2, Math.floor(opts.width ?? 40));
   const available = usedPercent != null;
   const remaining = available ? remainingPercent(usedPercent) : null;
   const pctColor = gaugeColor(usedPercent);
@@ -438,7 +445,8 @@ function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
 
   const lines = [top];
   for (const body of [titleLine, big, usedLine, gaugeLine, resetLine]) {
-    lines.push(color("│", ansi.rule) + padRight(body, width - 2) + color("│", ansi.rule));
+    const content = truncate(body, width - 2);
+    lines.push(color("│", ansi.rule) + padRight(content, width - 2) + color("│", ansi.rule));
   }
   lines.push(bottom);
   return lines;
@@ -448,8 +456,7 @@ function buildCard(title, subtitle, usedPercent, resetsAt, opts = {}) {
 // Layout
 // ---------------------------------------------------------------------------
 
-function makeLayout(state) {
-  const cols = Math.max(20, Math.min(120, process.stdout.columns || 80));
+function makeLayout(state, cols = terminalSize().cols) {
   const gap = 2;
   const limits = activeLimits(state.rate?.rateLimits);
   const sideBySide = limits.length > 1 && cols >= 72;
@@ -498,7 +505,7 @@ function makeLayout(state) {
     const hModel = color("model", ansi.muted);
     const hTitle = color("title", ansi.muted);
     recentLines.push(`  ${padRight(hTime, 10)} ${padRight(hTokens, 10)} ${padRight(hProvider, 8)} ${padRight(hModel, 14)} ${hTitle}`);
-    recentLines.push(color("  " + "─".repeat(cols - 4), ansi.rule));
+    recentLines.push(color("  " + "─".repeat(Math.max(0, cols - 4)), ansi.rule));
 
     for (const row of recentRows.slice(0, 5)) {
       const time = color(relativeTime(row.updatedAt).padEnd(10), ansi.grey);
@@ -519,8 +526,8 @@ function makeLayout(state) {
 }
 
 // Compose the full frame as an array of pre-styled lines.
-function composeFrame(state) {
-  const { cardLines, localLines, recentLines, cols } = makeLayout(state);
+function composeFrame(state, cols = terminalSize().cols) {
+  const { cardLines, localLines, recentLines } = makeLayout(state, cols);
 
   const lines = [];
 
@@ -580,11 +587,13 @@ class Frame {
   constructor() {
     this.lines = [];
     this.cols = 0;
+    this.rows = 0;
   }
 
-  set(lines, cols) {
+  set(lines, cols, rows = lines.length) {
     this.lines = lines;
     this.cols = cols;
+    this.rows = rows;
   }
 }
 
@@ -598,11 +607,6 @@ function diffAndDraw(prev, next) {
     out += goto(i + 1, 1);
     out += ansi.clearLine;
     if (nextLine) out += nextLine;
-    out += "\r\n";
-  }
-  // Clear any leftover lines below the new frame.
-  for (let i = maxRows; i < prev.lines.length; i += 1) {
-    out += goto(i + 1, 1) + ansi.clearLine + "\r\n";
   }
   return out;
 }
@@ -660,15 +664,15 @@ async function main() {
   const nextFrame = new Frame();
 
   const draw = () => {
-    const cols = Math.max(20, Math.min(120, process.stdout.columns || 80));
-    const lines = composeFrame(state);
-    nextFrame.set(lines, cols);
+    const { cols, rows } = terminalSize();
+    const lines = composeFrame(state, cols).slice(0, rows);
+    nextFrame.set(lines, cols, rows);
 
-    const resized = prevFrame.cols && prevFrame.cols !== cols;
-    if (resized) prevFrame.set([], 0);
+    const resized = prevFrame.cols && (prevFrame.cols !== cols || prevFrame.rows !== rows);
+    if (resized) prevFrame.set([], 0, 0);
     let out = (resized ? ansi.clear + ansi.home : "") + diffAndDraw(prevFrame, nextFrame);
     if (out) process.stdout.write(out);
-    prevFrame.set(lines, cols);
+    prevFrame.set(lines, cols, rows);
   };
 
   const tick = () => {
@@ -713,6 +717,7 @@ async function main() {
     process.stdout.write(ansi.show);
     process.stdout.write("\x1b[?1049l"); // leave alt screen
   });
+  process.stdout.on("resize", draw);
 
   // Initial draw.
   tick();
@@ -731,6 +736,8 @@ function selfCheck() {
   assert.equal(activeLimits({ primary: { used_percent: 10 }, secondary: { used_percent: 20 } }).length, 2);
   const weekly = stripAnsi(buildCard(limitTitle({ window_minutes: 10080 }), null, 10, 0).join("\n"));
   assert.match(weekly, /Weekly usage limit/);
+  const narrowFrame = composeFrame({ totalToday: 0, totalAll: 0, threadCount: 0, recent: [], rate: null, error: null }, 10);
+  assert.ok(narrowFrame.every((line) => visibleLen(line) <= 10));
 }
 
 if (process.env.CODEX_USAGE_MONITOR_SELF_TEST) {
