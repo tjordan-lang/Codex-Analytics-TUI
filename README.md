@@ -4,7 +4,7 @@ A simple terminal-based monitor for Codex usage.
 
 ## What it shows
 
-- Every usage limit Codex reports (currently weekly)
+- Every usage limit Codex reports
 - Current local Codex session info
 
 ## What it does
@@ -24,4 +24,3 @@ node ~/codex-usage-monitor.mjs
 - This tool is local-only.
 - It shows usage data for the machine it is run on.
 - It may display local Codex session titles and metadata.
-- If Codex restores the 5-hour limit, it appears automatically beside the weekly limit.
